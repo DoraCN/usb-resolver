@@ -2,6 +2,10 @@
 name = "usb-resolver"
 version = "0.1.0"
 edition = "2024"
+description = "USB Resolver & Device Monitor"
+authors = ["Leon <echo_ai@foxmail.com>"]
+license = "MIT"
+repository = "https://github.com/DoraCN/usb-resolver"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
