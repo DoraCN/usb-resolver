@@ -1,0 +1,16 @@
+[
+  {
+    "role": "top_camera",
+    "vid": 12944,
+    "pid": 9797,
+    "serial": "SN-8899-AABB",
+    "port_path": null
+  },
+  {
+    "role": "left_arm_sensor",
+    "vid": 36901,
+    "pid": 12930,
+    "serial": null,
+    "port_path": "0x14100000"
+  }
+]
