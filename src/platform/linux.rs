@@ -1,345 +1,157 @@
-use crate::{DeviceEvent, DeviceMonitor, DeviceRule, RawDeviceInfo, ResolvedDevice};
-use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::Sender;
-use std::collections::HashMap;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
-use udev::{Enumerator, EventType, MonitorBuilder};
+// Linux USB 监控原理：一切皆文件
+// 在 Linux 上，我们和 “文件系统” 打交道。这体现了 Linux 的哲学：Everything is a file (一切皆文件)。
+// Linux 的 USB 管理分两部分：
+//     静态数据 (sysfs)：
+//         位置：/sys/bus/usb/devices/...
+//         这里存放着当前系统所有硬件的状态。
+//         要查 VID，就读 idVendor 文件；要查 PID，就读 idProduct 文件。
+//     动态事件 (udev / Netlink)：
+//         当硬件插拔时，内核会通过一个特殊的 Socket（Netlink Socket）向用户空间广播消息。
+//         udev 是 Linux 的设备管理器，它监听这个 Socket，处理这堆乱七八糟的消息，并对外提供更友好的接口。
+// 前置要求： 在编译 Linux 版本之前，你的系统（或开发容器）里必须安装 libudev 的开发包。
+//
+// Debian/Ubuntu: sudo apt install libudev-dev
+// Fedora: sudo dnf install systemd-devel
+//
+
+use std::{thread, time::Duration};
+
+use udev::{Device, Enumerator};
+
+use crate::RawDeviceInfo;
+
+const ID_VENDOR: &str = "idVendor";
+const ID_PRODUCT: &str = "idProduct";
+const USB_SERIAL: &str = "serial";
 
 pub struct LinuxMonitor;
+
+impl Default for LinuxMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LinuxMonitor {
     pub fn new() -> Self {
         Self
     }
 
-    /// 查找归属于当前 USB 设备的 TTY 子节点
-    /// 例如：输入是 USB Device (1-1.2), 输出是 "/dev/ttyUSB0"
-    fn find_tty_node(parent: &udev::Device) -> Option<String> {
+    // Utility function for securely reading attributes
+    // In Linux, attributes are OsStr, which we need to convert to String
+    // 工具函数 安全读取属性
+    // Linux 的属性是 OsStr，我们需要转换成 String
+    fn get_property(dev: &Device, key: &str) -> Option<String> {
+        dev.property_value(key)
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    }
+
+    // Utility functions read sysfs attributes
+    // Some attributes are not in the udev database, but in the /sys file
+    // 工具函数 读取 sysfs 属性
+    // 有些属性不在 udev 数据库里，而是在 /sys 文件里
+    fn get_attribute(dev: &Device, key: &str) -> Option<String> {
+        dev.attribute_value(key)
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    }
+
+    // Recursively search for the TTY node
+    // Given a USB device, find its corresponding /dev/ttyUSBx or /dev/ttyACMx
+    // 递归查找 TTY 节点
+    // 给定一个 USB 设备，找到它对应的 /dev/ttyUSBx 或者 /dev/ttyACMx
+    fn find_tty_node(usb_dev: &Device) -> Option<String> {
+        // Create an enumerator to iterate through the sub-devices.
+        // 创建一个枚举器，用于遍历子设备
         let mut enumerator = Enumerator::new().ok()?;
 
-        // 1. 过滤 subsystem = "tty"
+        // Set matching criteria: It must be a child device of the current usb_dev.
+        // 设置匹配条件：必须是当前 usb_dev 的子设备
+        enumerator.match_parent(usb_dev).ok()?;
+
+        // Set matching criteria: The subsystem type is "tty".
+        // 设置匹配条件：子系统的类型是 "tty"
         enumerator.match_subsystem("tty").ok()?;
 
-        // 2. 关键过滤：只找 parent 是当前设备的孩子
-        enumerator.match_parent(parent).ok()?;
-
-        // 3. 扫描并返回第一个结果
+        // Traversal results
+        // 遍历结果
         for child in enumerator.scan_devices().ok()? {
+            // Return the first devnode found (e.g., /dev/ttyUSB0).
+            // 找到第一个 devnode (例如 /dev/ttyUSB0) 就返回
             if let Some(devnode) = child.devnode() {
-                if let Some(path) = devnode.to_str() {
-                    return Some(path.to_string());
-                }
+                return devnode.to_str().map(|s| s.to_string());
             }
         }
+
         None
     }
 
-    fn parse_device(dev: udev::Device) -> Option<RawDeviceInfo> {
-        let subsystem = dev.subsystem().and_then(|s| s.to_str());
-        if subsystem != Some("usb") {
+    // parse device
+    // 解析设备
+    fn parse_device(dev: &Device) -> Option<RawDeviceInfo> {
+        // Only devices with the "USB" subsystem have VID/PID.
+        // 只有 "usb" 子系统的设备才有 VID/PID
+        if dev.subsystem().and_then(|s| s.to_str()) != Some("usb") {
             return None;
         }
 
-        let devtype = dev.devtype().and_then(|s| s.to_str());
-        if devtype != Some("usb_device") {
+        // Only devices of type "usb_device" are considered physical devices (excluding usb_interface).
+        // 只有 "usb_device" 类型才算物理设备 (排除 usb_interface)
+        if dev.devtype().and_then(|s| s.to_str()) != Some("usb_device") {
             return None;
         }
 
-        let vid = if let Some(v) = dev.property_value("ID_VENDOR_ID") {
-            let s = v.to_str().unwrap_or("");
-            u16::from_str_radix(s, 16).ok()?
-        } else {
-            let v = dev
-                .attribute_value("idVendor")
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            u16::from_str_radix(v, 16).ok()?
-        };
+        // Read VID/PID (this is a hexadecimal string, such as "1a86")
+        // 读取 VID / PID (这是 16 进制字符串，如 "1a86")
+        let vid_str = Self::get_attribute(dev, ID_VENDOR)?;
+        let pid_str = Self::get_attribute(dev, ID_PRODUCT)?;
 
-        let pid = if let Some(p) = dev.property_value("ID_MODEL_ID") {
-            let s = p.to_str().unwrap_or("");
-            u16::from_str_radix(s, 16).ok()?
-        } else {
-            let p = dev
-                .attribute_value("idProduct")
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            u16::from_str_radix(p, 16).ok()?
-        };
+        // Parsing hex strings
+        // 解析 hex 字符串
+        let vid = u16::from_str_radix(&vid_str, 16).ok()?;
+        let pid = u16::from_str_radix(&pid_str, 16).ok()?;
 
+        // Read Serial
+        // 读取 Serial
+        let serial = Self::get_attribute(dev, USB_SERIAL);
+
+        // Get a unique ID
+        // 获取唯一 ID
+        let syspath = dev.syspath().to_str()?.to_string();
+
+        // Get Port Path (physical port path)
+        // In Linux, devpath is similar to "1-1.2", which is suitable for use as a port path.
+        // 获取 Port Path (物理端口路径)
+        // Linux 下 devpath 类似 "1-1.2"，直接用作 Port Path 很合适
         let port_path = dev
-            .property_value("ID_PATH")
+            .syspath()
+            .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let serial = dev
-            .property_value("ID_SERIAL_SHORT")
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string());
-
-        // 原始的总线路径 (/dev/bus/usb/001/005)
-        let raw_usb_path = dev
-            .devnode()
-            .and_then(|p| p.to_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                dev.syspath()
-                    .to_str()
-                    .unwrap_or("invalid_utf8_path")
-                    .to_string()
-            });
+            .unwrap_or("N/A".to_string());
 
-        // 查找 TTY 节点 (/dev/ttyUSB0)
-        let tty_path = Self::find_tty_node(&dev);
+        // Locate the TTY path (with retry mechanism). The driver may not be properly mounted when the device is first inserted.
+        // 查找 TTY 路径 (带重试机制), 刚插入时可能驱动还没挂载好
+        let mut tty_node = None;
+        let max_retries = 20;
 
-        // 决策：
-        // 如果找到了 TTY，它就是主路径 (system_path)，Raw Path 变为备用。
-        // 如果没找到 TTY (比如键盘)，Raw Path 是主路径。
-        let (system_path, system_path_alt) = match tty_path {
-            Some(tty) => (tty, Some(raw_usb_path)),
-            None => (raw_usb_path, None),
-        };
+        for _ in 0..max_retries {
+            if let Some(node) = Self::find_tty_node(dev) {
+                tty_node = Some(node);
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
 
         Some(RawDeviceInfo {
             vid,
             pid,
             serial,
             port_path,
-            system_path,
-            system_path_alt,
+            system_path: syspath,      // primary key: /sys/devices/...
+            system_path_alt: tty_node, // Actual path: /dev/ttyUSB0
         })
-    }
-}
-
-impl DeviceMonitor for LinuxMonitor {
-    fn scan_now(&self) -> Result<Vec<RawDeviceInfo>> {
-        let mut enumerator = Enumerator::new()?;
-        enumerator.match_subsystem("usb")?;
-        enumerator.match_property("DEVTYPE", "usb_device")?;
-
-        let mut devices = Vec::new();
-        for dev in enumerator.scan_devices()? {
-            if let Some(info) = Self::parse_device(dev) {
-                devices.push(info);
-            }
-        }
-        Ok(devices)
-    }
-
-    fn start(&self, rules: Vec<DeviceRule>, tx: Sender<DeviceEvent>) -> Result<()> {
-        let mut active_roles: HashMap<String, String> = HashMap::new();
-        let mut path_to_role: HashMap<String, String> = HashMap::new();
-
-        // 1. 初始扫描
-        log::info!("正在进行初始 USB 扫描...");
-        if let Ok(initial_devices) = self.scan_now() {
-            for dev in initial_devices {
-                for rule in &rules {
-                    if let Some(method) = rule.matches(&dev) {
-                        if !active_roles.contains_key(&rule.role) {
-                            active_roles.insert(rule.role.clone(), dev.system_path.clone());
-                            path_to_role.insert(dev.system_path.clone(), rule.role.clone());
-
-                            tx.send(DeviceEvent::Attached(ResolvedDevice {
-                                role: rule.role.clone(),
-                                device: dev.clone(),
-                                match_method: method,
-                            }))
-                            .ok();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let (init_tx, init_rx) = mpsc::channel();
-        let monitor_clone = LinuxMonitor::new();
-
-        // 2. 启动监听线程
-        thread::Builder::new()
-            .name("usb-monitor".to_string())
-            .spawn(move || {
-                let mut use_polling = false;
-
-                // --- 尝试 A: 使用 udev Netlink 监听 ---
-                let init_result = (|| -> Result<udev::MonitorSocket> {
-                    let builder = MonitorBuilder::new().context("Builder init failed")?;
-                    let monitor = builder.match_subsystem("usb")?.listen()?;
-                    Ok(monitor)
-                })();
-
-                match init_result {
-                    Ok(monitor) => {
-                        log::info!("[udev-thread] udev 监听初始化成功");
-                        let _ = init_tx.send(Ok(()));
-
-                        for event in monitor.iter() {
-                            match event.event_type() {
-                                EventType::Add => {
-                                    if let Some(dev) = Self::parse_device(event.device()) {
-                                        for rule in &rules {
-                                            if let Some(method) = rule.matches(&dev) {
-                                                if active_roles.contains_key(&rule.role) {
-                                                    continue;
-                                                }
-
-                                                log::info!("[udev] 匹配设备上线: {}", rule.role);
-                                                active_roles.insert(
-                                                    rule.role.clone(),
-                                                    dev.system_path.clone(),
-                                                );
-                                                path_to_role.insert(
-                                                    dev.system_path.clone(),
-                                                    rule.role.clone(),
-                                                );
-
-                                                if let Err(_) =
-                                                    tx.send(DeviceEvent::Attached(ResolvedDevice {
-                                                        role: rule.role.clone(),
-                                                        device: dev,
-                                                        match_method: method,
-                                                    }))
-                                                {
-                                                    return;
-                                                }
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                EventType::Remove => {
-                                    let key = event
-                                        .device()
-                                        .devnode()
-                                        .and_then(|p| p.to_str())
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| {
-                                            event
-                                                .device()
-                                                .syspath()
-                                                .to_str()
-                                                .unwrap_or("")
-                                                .to_string()
-                                        });
-
-                                    // 注意：这里有个小坑。如果 parse_device 把 system_path 改成了 tty，
-                                    // 但 udev Remove 事件传回来的可能是 usb_device 的 devnode。
-                                    // 幸好我们 path_to_role 的 Key 存的是 system_path。
-                                    // 为了保险，Remove 时我们也需要尽可能找到 system_path。
-                                    // 但 Remove 时 tty 节点可能已经先没了。
-                                    //
-                                    // 在 Polling 模式下这没问题。
-                                    // 在 Netlink 模式下，如果 remove 事件匹配不到 path_to_role，我们可能需要遍历 Values 查找。
-                                    //
-                                    // 简单修复：尝试直接 remove，如果不行，遍历查找。
-                                    if let Some(role) = path_to_role.remove(&key) {
-                                        log::info!("[udev] 设备移除: {}", role);
-                                        active_roles.remove(&role);
-                                        if let Err(_) = tx.send(DeviceEvent::Detached(role)) {
-                                            return;
-                                        }
-                                    } else {
-                                        // Fallback: 如果 Key 不匹配（因为 system_path 变成了 /dev/tty...），
-                                        // 我们需要检查 path_to_role 的 Values 里面有没有谁的 alt_path 是这个 key
-                                        // 这里简单处理：如果找不到，依赖 Polling 或者忽略
-                                        // (在工业场景通常用 Polling 兜底会更稳)
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        log::warn!("[udev-thread] udev socket 意外关闭，切换至轮询模式...");
-                        use_polling = true;
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "[udev-thread] udev 初始化失败 ({:?})，直接切换至轮询模式",
-                            e
-                        );
-                        let _ = init_tx.send(Ok(()));
-                        use_polling = true;
-                    }
-                }
-
-                // --- 尝试 B: 轮询兜底模式 ---
-                if use_polling {
-                    log::info!("[udev-thread] 已启动轮询模式 (Polling Mode)，扫描间隔: 2秒");
-
-                    loop {
-                        thread::sleep(Duration::from_secs(2));
-
-                        // 1. 扫描当前所有设备
-                        let current_devices = match monitor_clone.scan_now() {
-                            Ok(devs) => devs,
-                            Err(e) => {
-                                log::error!("轮询扫描失败: {:?}", e);
-                                continue;
-                            }
-                        };
-
-                        let mut current_matches: HashMap<
-                            String,
-                            (String, RawDeviceInfo, crate::MatchMethod),
-                        > = HashMap::new();
-
-                        for dev in current_devices {
-                            for rule in &rules {
-                                if let Some(method) = rule.matches(&dev) {
-                                    current_matches.insert(
-                                        rule.role.clone(),
-                                        (dev.system_path.clone(), dev, method),
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 3. Diff: 检测【新上线】
-                        for (role, (path, dev, method)) in &current_matches {
-                            if !active_roles.contains_key(role) {
-                                log::info!("[Polling] 设备上线: {} -> {}", role, path);
-                                active_roles.insert(role.clone(), path.clone());
-                                path_to_role.insert(path.clone(), role.clone());
-
-                                if let Err(_) = tx.send(DeviceEvent::Attached(ResolvedDevice {
-                                    role: role.clone(),
-                                    device: dev.clone(),
-                                    match_method: *method,
-                                })) {
-                                    return;
-                                }
-                            }
-                        }
-
-                        // 4. Diff: 检测【已掉线】
-                        let mut roles_to_remove = Vec::new();
-                        for (role, path) in &active_roles {
-                            if !current_matches.contains_key(role) {
-                                roles_to_remove.push((role.clone(), path.clone()));
-                            }
-                        }
-
-                        for (role, path) in roles_to_remove {
-                            log::info!("[Polling] 设备下线: {}", role);
-                            active_roles.remove(&role);
-                            path_to_role.remove(&path);
-                            if let Err(_) = tx.send(DeviceEvent::Detached(role)) {
-                                return;
-                            }
-                        }
-                    }
-                }
-            })
-            .expect("Failed to spawn monitor thread");
-
-        match init_rx.recv() {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("监听线程崩溃")),
-        }
     }
 }
