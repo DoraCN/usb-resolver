@@ -14,6 +14,8 @@ anyhow = "1.0"
 crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.10"
+ratatui = "0.30.0"
+crossterm = "0.29.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev = "0.7"

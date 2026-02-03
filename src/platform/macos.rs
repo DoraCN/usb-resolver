@@ -27,7 +27,7 @@ use io_kit_sys::{
     keys::kIOPublishNotification,
     types::{io_iterator_t, io_service_t},
 };
-use log::{info, warn};
+use log::info;
 
 use crate::{DeviceEvent, DeviceMonitor, RawDeviceInfo};
 
@@ -40,7 +40,7 @@ const IO_SERVICE_TERMINATE: &str = "IOServiceTerminate";
 const ID_VENDOR: &str = "idVendor";
 const ID_PRODUCT: &str = "idProduct";
 const USB_SERIAL_NUMBER: &str = "USB Serial Number";
-const USB_PRODUCT_NAME: &str = "USB Product Name";
+// const USB_PRODUCT_NAME: &str = "USB Product Name";
 const LOCATION_ID: &str = "locationID";
 
 // 建立与内核的通信管道
@@ -358,11 +358,11 @@ impl MacMonitor {
 
         // Strategy: If it's a serial device, prioritize using `cu`. If not (e.g., a keyboard), use `registry_path` as a placeholder.
         // 策略：如果是串口设备，优先用 cu。如果不是(比如键盘)，用 registry_path 占位。
-        let (system_path, system_path_alt) = match (cu, tty) {
-            (Some(c), Some(t)) => (c, Some(t)),    // 完美：都有
-            (Some(c), None) => (c, None),          // 只有 cu
-            (None, Some(t)) => (t, None),          // 只有 tty
-            (None, None) => (registry_path, None), // 不是串口设备
+        let usable_path = match (cu, tty) {
+            (Some(c), Some(_)) => Some(c), // 优先用 cu
+            (Some(c), None) => Some(c),
+            (None, Some(t)) => Some(t),
+            (None, None) => None,
         };
 
         Some(RawDeviceInfo {
@@ -370,8 +370,8 @@ impl MacMonitor {
             pid,
             serial,
             port_path,
-            system_path,
-            system_path_alt,
+            system_path: registry_path,
+            system_path_alt: usable_path,
         })
     }
 }
