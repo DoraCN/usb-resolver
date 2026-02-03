@@ -1,3 +1,4 @@
+use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 pub mod platform;
@@ -43,9 +44,9 @@ pub enum MatchMethod {
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
     /// 一个符合配置要求的设备已上线
-    Attached(ResolvedDevice),
+    Attached(RawDeviceInfo),
     /// 已知的设备已移除
-    Detached(RoleId),
+    Detached(String),
 }
 
 /// 单个设备的配置规则
@@ -100,11 +101,7 @@ impl DeviceRule {
 /// 统一的监听器 trait
 pub trait DeviceMonitor {
     /// 启动监听，阻塞当前线程或在后台运行，通过 channel 发送事件
-    fn start(
-        &self,
-        rules: Vec<DeviceRule>,
-        event_sender: crossbeam_channel::Sender<DeviceEvent>,
-    ) -> anyhow::Result<()>;
+    fn start(&self, tx: Sender<DeviceEvent>) -> anyhow::Result<()>;
 
     /// 立即扫描一次当前所有设备（用于程序启动时的初始状态构建）
     fn scan_now(&self) -> anyhow::Result<Vec<RawDeviceInfo>>;

@@ -62,13 +62,20 @@ fn main() -> anyhow::Result<()> {
 
     // Ok(())
 
-    let monitor = usb_resolver::get_monitor(); // 会根据系统获取 MacosMonitor
+    let monitor = usb_resolver::get_monitor();
+    let (tx, rx) = crossbeam_channel::unbounded();
 
-    println!("正在扫描设备...");
-    let devices = monitor.scan_now()?;
+    println!("启动监听...");
+    monitor.start(tx)?;
 
-    for dev in devices {
-        println!("{:#?}", dev);
+    // 主线程在这里等消息
+    loop {
+        match rx.recv() {
+            Ok(event) => {
+                println!("收到事件: {:?}", event);
+            }
+            Err(_) => break,
+        }
     }
 
     Ok(())
