@@ -1,14 +1,14 @@
 // Linux USB 监控原理: 一切皆文件
-// 在 Linux 上，我们和 “文件系统” 打交道。这体现了 Linux 的哲学: Everything is a file (一切皆文件)。
+// 在 Linux 上, 我们和 “文件系统” 打交道。这体现了 Linux 的哲学: Everything is a file (一切皆文件)。
 // Linux 的 USB 管理分两部分:
 //     静态数据 (sysfs):
 //         位置: /sys/bus/usb/devices/...
 //         这里存放着当前系统所有硬件的状态。
-//         要查 VID，就读 idVendor 文件；要查 PID，就读 idProduct 文件。
+//         要查 VID, 就读 idVendor 文件；要查 PID, 就读 idProduct 文件。
 //     动态事件 (udev / Netlink):
-//         当硬件插拔时，内核会通过一个特殊的 Socket（Netlink Socket）向用户空间广播消息。
-//         udev 是 Linux 的设备管理器，它监听这个 Socket，处理这堆乱七八糟的消息，并对外提供更友好的接口。
-// 前置要求:  在编译 Linux 版本之前，你的系统（或开发容器）里必须安装 libudev 的开发包。
+//         当硬件插拔时, 内核会通过一个特殊的 Socket（Netlink Socket）向用户空间广播消息。
+//         udev 是 Linux 的设备管理器, 它监听这个 Socket, 处理这堆乱七八糟的消息, 并对外提供更友好的接口。
+// 前置要求: 在编译 Linux 版本之前, 你的系统（或开发容器）里必须安装 libudev 的开发包。
 //
 // Debian/Ubuntu: sudo apt install libudev-dev
 // Fedora: sudo dnf install systemd-devel
@@ -48,10 +48,10 @@ impl LinuxMonitor {
     // Recursively search for the TTY node
     // Given a USB device, find its corresponding /dev/ttyUSBx or /dev/ttyACMx
     // 递归查找 TTY 节点
-    // 给定一个 USB 设备，找到它对应的 /dev/ttyUSBx 或者 /dev/ttyACMx
+    // 给定一个 USB 设备, 找到它对应的 /dev/ttyUSBx 或者 /dev/ttyACMx
     fn find_tty_node(usb_dev: &Device) -> Option<String> {
         // Create an enumerator to iterate through the sub-devices.
-        // 创建一个枚举器，用于遍历子设备
+        // 创建一个枚举器, 用于遍历子设备
         let mut enumerator = Enumerator::new().ok()?;
 
         // Set matching criteria: The subsystem type is "tty".
@@ -161,7 +161,7 @@ impl DeviceMonitor for LinuxMonitor {
 
         thread::spawn(move || {
             // Create a Builder and configure filtering rules.
-            // 创建 Builder，配置过滤规则
+            // 创建 Builder, 配置过滤规则
             let builder = match udev::MonitorBuilder::new()
                 // .and_then(|b| b.match_subsystem_devtype("usb", "usb_device"))
                 .and_then(|b| b.match_subsystem("usb"))
