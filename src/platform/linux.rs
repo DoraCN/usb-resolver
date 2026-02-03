@@ -1,38 +1,30 @@
-#[cfg(target_os = "linux")]
-use crate::{DeviceMonitor, DeviceRule, DeviceEvent, RawDeviceInfo, ResolvedDevice};
-#[cfg(target_os = "linux")]
+use crate::{DeviceEvent, DeviceMonitor, DeviceRule, RawDeviceInfo, ResolvedDevice};
 use anyhow::{Context, Result, anyhow};
-#[cfg(target_os = "linux")]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::thread;
-#[cfg(target_os = "linux")]
-use std::time::Duration;
-#[cfg(target_os = "linux")]
 use std::sync::mpsc;
-#[cfg(target_os = "linux")]
+use std::thread;
+use std::time::Duration;
 use udev::{Enumerator, EventType, MonitorBuilder};
 
-#[cfg(target_os = "linux")]
 pub struct LinuxMonitor;
 
-#[cfg(target_os = "linux")]
 impl LinuxMonitor {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// 查找归属于当前 USB 设备的 TTY 子节点
     /// 例如：输入是 USB Device (1-1.2), 输出是 "/dev/ttyUSB0"
     fn find_tty_node(parent: &udev::Device) -> Option<String> {
         let mut enumerator = Enumerator::new().ok()?;
-        
+
         // 1. 过滤 subsystem = "tty"
         enumerator.match_subsystem("tty").ok()?;
-        
+
         // 2. 关键过滤：只找 parent 是当前设备的孩子
         enumerator.match_parent(parent).ok()?;
-        
+
         // 3. 扫描并返回第一个结果
         for child in enumerator.scan_devices().ok()? {
             if let Some(devnode) = child.devnode() {
@@ -43,19 +35,26 @@ impl LinuxMonitor {
         }
         None
     }
-    
+
     fn parse_device(dev: udev::Device) -> Option<RawDeviceInfo> {
         let subsystem = dev.subsystem().and_then(|s| s.to_str());
-        if subsystem != Some("usb") { return None; }
-        
+        if subsystem != Some("usb") {
+            return None;
+        }
+
         let devtype = dev.devtype().and_then(|s| s.to_str());
-        if devtype != Some("usb_device") { return None; }
+        if devtype != Some("usb_device") {
+            return None;
+        }
 
         let vid = if let Some(v) = dev.property_value("ID_VENDOR_ID") {
             let s = v.to_str().unwrap_or("");
             u16::from_str_radix(s, 16).ok()?
         } else {
-            let v = dev.attribute_value("idVendor").and_then(|s| s.to_str()).unwrap_or("");
+            let v = dev
+                .attribute_value("idVendor")
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             u16::from_str_radix(v, 16).ok()?
         };
 
@@ -63,25 +62,34 @@ impl LinuxMonitor {
             let s = p.to_str().unwrap_or("");
             u16::from_str_radix(s, 16).ok()?
         } else {
-            let p = dev.attribute_value("idProduct").and_then(|s| s.to_str()).unwrap_or("");
+            let p = dev
+                .attribute_value("idProduct")
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             u16::from_str_radix(p, 16).ok()?
         };
-        
-        let port_path = dev.property_value("ID_PATH")
+
+        let port_path = dev
+            .property_value("ID_PATH")
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let serial = dev.property_value("ID_SERIAL_SHORT")
+        let serial = dev
+            .property_value("ID_SERIAL_SHORT")
             .and_then(|s| s.to_str())
             .map(|s| s.to_string());
 
         // 原始的总线路径 (/dev/bus/usb/001/005)
-        let raw_usb_path = dev.devnode()
+        let raw_usb_path = dev
+            .devnode()
             .and_then(|p| p.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
-                dev.syspath().to_str().unwrap_or("invalid_utf8_path").to_string()
+                dev.syspath()
+                    .to_str()
+                    .unwrap_or("invalid_utf8_path")
+                    .to_string()
             });
 
         // 查找 TTY 节点 (/dev/ttyUSB0)
@@ -96,19 +104,22 @@ impl LinuxMonitor {
         };
 
         Some(RawDeviceInfo {
-            vid, pid, serial, port_path, system_path,
+            vid,
+            pid,
+            serial,
+            port_path,
+            system_path,
             system_path_alt,
         })
     }
 }
 
-#[cfg(target_os = "linux")]
 impl DeviceMonitor for LinuxMonitor {
     fn scan_now(&self) -> Result<Vec<RawDeviceInfo>> {
         let mut enumerator = Enumerator::new()?;
         enumerator.match_subsystem("usb")?;
         enumerator.match_property("DEVTYPE", "usb_device")?;
-        
+
         let mut devices = Vec::new();
         for dev in enumerator.scan_devices()? {
             if let Some(info) = Self::parse_device(dev) {
@@ -131,13 +142,14 @@ impl DeviceMonitor for LinuxMonitor {
                         if !active_roles.contains_key(&rule.role) {
                             active_roles.insert(rule.role.clone(), dev.system_path.clone());
                             path_to_role.insert(dev.system_path.clone(), rule.role.clone());
-                            
+
                             tx.send(DeviceEvent::Attached(ResolvedDevice {
                                 role: rule.role.clone(),
                                 device: dev.clone(),
                                 match_method: method,
-                            })).ok();
-                            break; 
+                            }))
+                            .ok();
+                            break;
                         }
                     }
                 }
@@ -145,7 +157,7 @@ impl DeviceMonitor for LinuxMonitor {
         }
 
         let (init_tx, init_rx) = mpsc::channel();
-        let monitor_clone = LinuxMonitor::new(); 
+        let monitor_clone = LinuxMonitor::new();
 
         // 2. 启动监听线程
         thread::Builder::new()
@@ -163,7 +175,7 @@ impl DeviceMonitor for LinuxMonitor {
                 match init_result {
                     Ok(monitor) => {
                         log::info!("[udev-thread] udev 监听初始化成功");
-                        let _ = init_tx.send(Ok(())); 
+                        let _ = init_tx.send(Ok(()));
 
                         for event in monitor.iter() {
                             match event.event_type() {
@@ -171,59 +183,85 @@ impl DeviceMonitor for LinuxMonitor {
                                     if let Some(dev) = Self::parse_device(event.device()) {
                                         for rule in &rules {
                                             if let Some(method) = rule.matches(&dev) {
-                                                if active_roles.contains_key(&rule.role) { continue; }
-                                                
+                                                if active_roles.contains_key(&rule.role) {
+                                                    continue;
+                                                }
+
                                                 log::info!("[udev] 匹配设备上线: {}", rule.role);
-                                                active_roles.insert(rule.role.clone(), dev.system_path.clone());
-                                                path_to_role.insert(dev.system_path.clone(), rule.role.clone());
-                                                
-                                                if let Err(_) = tx.send(DeviceEvent::Attached(ResolvedDevice {
-                                                    role: rule.role.clone(),
-                                                    device: dev,
-                                                    match_method: method,
-                                                })) { return; }
+                                                active_roles.insert(
+                                                    rule.role.clone(),
+                                                    dev.system_path.clone(),
+                                                );
+                                                path_to_role.insert(
+                                                    dev.system_path.clone(),
+                                                    rule.role.clone(),
+                                                );
+
+                                                if let Err(_) =
+                                                    tx.send(DeviceEvent::Attached(ResolvedDevice {
+                                                        role: rule.role.clone(),
+                                                        device: dev,
+                                                        match_method: method,
+                                                    }))
+                                                {
+                                                    return;
+                                                }
                                                 break;
                                             }
                                         }
                                     }
-                                },
+                                }
                                 EventType::Remove => {
-                                    let key = event.device().devnode()
+                                    let key = event
+                                        .device()
+                                        .devnode()
                                         .and_then(|p| p.to_str())
                                         .map(|s| s.to_string())
-                                        .unwrap_or_else(|| event.device().syspath().to_str().unwrap_or("").to_string());
+                                        .unwrap_or_else(|| {
+                                            event
+                                                .device()
+                                                .syspath()
+                                                .to_str()
+                                                .unwrap_or("")
+                                                .to_string()
+                                        });
 
                                     // 注意：这里有个小坑。如果 parse_device 把 system_path 改成了 tty，
                                     // 但 udev Remove 事件传回来的可能是 usb_device 的 devnode。
                                     // 幸好我们 path_to_role 的 Key 存的是 system_path。
                                     // 为了保险，Remove 时我们也需要尽可能找到 system_path。
                                     // 但 Remove 时 tty 节点可能已经先没了。
-                                    // 
+                                    //
                                     // 在 Polling 模式下这没问题。
                                     // 在 Netlink 模式下，如果 remove 事件匹配不到 path_to_role，我们可能需要遍历 Values 查找。
-                                    // 
+                                    //
                                     // 简单修复：尝试直接 remove，如果不行，遍历查找。
                                     if let Some(role) = path_to_role.remove(&key) {
                                         log::info!("[udev] 设备移除: {}", role);
                                         active_roles.remove(&role);
-                                        if let Err(_) = tx.send(DeviceEvent::Detached(role)) { return; }
+                                        if let Err(_) = tx.send(DeviceEvent::Detached(role)) {
+                                            return;
+                                        }
                                     } else {
                                         // Fallback: 如果 Key 不匹配（因为 system_path 变成了 /dev/tty...），
                                         // 我们需要检查 path_to_role 的 Values 里面有没有谁的 alt_path 是这个 key
                                         // 这里简单处理：如果找不到，依赖 Polling 或者忽略
                                         // (在工业场景通常用 Polling 兜底会更稳)
                                     }
-                                },
+                                }
                                 _ => {}
                             }
                         }
-                        
+
                         log::warn!("[udev-thread] udev socket 意外关闭，切换至轮询模式...");
                         use_polling = true;
-                    },
+                    }
                     Err(e) => {
-                        log::warn!("[udev-thread] udev 初始化失败 ({:?})，直接切换至轮询模式", e);
-                        let _ = init_tx.send(Ok(())); 
+                        log::warn!(
+                            "[udev-thread] udev 初始化失败 ({:?})，直接切换至轮询模式",
+                            e
+                        );
+                        let _ = init_tx.send(Ok(()));
                         use_polling = true;
                     }
                 }
@@ -231,7 +269,7 @@ impl DeviceMonitor for LinuxMonitor {
                 // --- 尝试 B: 轮询兜底模式 ---
                 if use_polling {
                     log::info!("[udev-thread] 已启动轮询模式 (Polling Mode)，扫描间隔: 2秒");
-                    
+
                     loop {
                         thread::sleep(Duration::from_secs(2));
 
@@ -244,12 +282,18 @@ impl DeviceMonitor for LinuxMonitor {
                             }
                         };
 
-                        let mut current_matches: HashMap<String, (String, RawDeviceInfo, crate::MatchMethod)> = HashMap::new();
+                        let mut current_matches: HashMap<
+                            String,
+                            (String, RawDeviceInfo, crate::MatchMethod),
+                        > = HashMap::new();
 
                         for dev in current_devices {
                             for rule in &rules {
                                 if let Some(method) = rule.matches(&dev) {
-                                    current_matches.insert(rule.role.clone(), (dev.system_path.clone(), dev, method));
+                                    current_matches.insert(
+                                        rule.role.clone(),
+                                        (dev.system_path.clone(), dev, method),
+                                    );
                                     break;
                                 }
                             }
@@ -261,12 +305,14 @@ impl DeviceMonitor for LinuxMonitor {
                                 log::info!("[Polling] 设备上线: {} -> {}", role, path);
                                 active_roles.insert(role.clone(), path.clone());
                                 path_to_role.insert(path.clone(), role.clone());
-                                
+
                                 if let Err(_) = tx.send(DeviceEvent::Attached(ResolvedDevice {
                                     role: role.clone(),
                                     device: dev.clone(),
                                     match_method: *method,
-                                })) { return; }
+                                })) {
+                                    return;
+                                }
                             }
                         }
 
@@ -282,7 +328,9 @@ impl DeviceMonitor for LinuxMonitor {
                             log::info!("[Polling] 设备下线: {}", role);
                             active_roles.remove(&role);
                             path_to_role.remove(&path);
-                            if let Err(_) = tx.send(DeviceEvent::Detached(role)) { return; }
+                            if let Err(_) = tx.send(DeviceEvent::Detached(role)) {
+                                return;
+                            }
                         }
                     }
                 }

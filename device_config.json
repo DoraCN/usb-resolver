@@ -1,16 +1,30 @@
 [
   {
-    "role": "top_camera",
-    "vid": 12944,
-    "pid": 9797,
-    "serial": "SN-8899-AABB",
-    "port_path": null
+    "role": "头部摄像头",
+    "vid": 1133,
+    "pid": 2093,
+    "serial": "91D1D1FF",
+    "port_path": "0x02123000"
   },
   {
-    "role": "left_arm_sensor",
-    "vid": 36901,
-    "pid": 12930,
-    "serial": null,
-    "port_path": "0x14100000"
+    "role": "黑色主臂",
+    "vid": 6790,
+    "pid": 21971,
+    "serial": "5AB0183575",
+    "port_path": "0x02122000"
+  },
+  {
+    "role": "白色从臂",
+    "vid": 6790,
+    "pid": 21971,
+    "serial": "5AB0179252",
+    "port_path": "0x02121000"
+  },
+  {
+    "role": "底盘小车",
+    "vid": 6790,
+    "pid": 21971,
+    "serial": "5AB0180264",
+    "port_path": "0x02123000"
   }
 ]

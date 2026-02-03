@@ -1,28 +1,18 @@
-#[cfg(target_os = "windows")]
 use crate::{DeviceEvent, DeviceMonitor, DeviceRule, RawDeviceInfo, ResolvedDevice};
-#[cfg(target_os = "windows")]
 use anyhow::Result;
-#[cfg(target_os = "windows")]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "windows")]
 use std::collections::HashMap;
-#[cfg(target_os = "windows")]
 use std::ffi::OsString;
-#[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStringExt;
-#[cfg(target_os = "windows")]
 use std::thread;
-#[cfg(target_os = "windows")]
 use std::time::Duration;
 
-#[cfg(target_os = "windows")]
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_IDW, CR_SUCCESS, DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA,
     SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SPDRP_LOCATION_PATHS, SetupDiDestroyDeviceInfoList,
     SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW,
 };
 
-#[cfg(target_os = "windows")]
 pub struct WindowsMonitor;
 
 impl Default for WindowsMonitor {
@@ -31,7 +21,6 @@ impl Default for WindowsMonitor {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl WindowsMonitor {
     pub fn new() -> Self {
         Self
@@ -164,7 +153,6 @@ impl WindowsMonitor {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl DeviceMonitor for WindowsMonitor {
     fn scan_now(&self) -> Result<Vec<RawDeviceInfo>> {
         unsafe {

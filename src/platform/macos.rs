@@ -1,426 +1,434 @@
-// src/platform/macos.rs
-
-#[cfg(target_os = "macos")]
-use crate::{DeviceMonitor, DeviceRule, DeviceEvent, RawDeviceInfo, ResolvedDevice};
-#[cfg(target_os = "macos")]
-use anyhow::{anyhow, Result};
-#[cfg(target_os = "macos")]
-use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
-use std::collections::HashMap;
-#[cfg(target_os = "macos")]
-use std::ffi::{c_void, CStr, CString};
-#[cfg(target_os = "macos")]
-use std::sync::Mutex;
-#[cfg(target_os = "macos")]
-use std::thread;
-#[cfg(target_os = "macos")]
-use std::time::Duration; // 引入 Duration
-
-// ... 其他引用保持不变 ...
-#[cfg(target_os = "macos")]
-use core_foundation::base::{kCFAllocatorDefault, CFRelease, CFTypeRef};
-#[cfg(target_os = "macos")]
-use core_foundation::number::{kCFNumberSInt32Type, CFNumberGetValue, CFNumberRef};
-#[cfg(target_os = "macos")]
-use core_foundation::string::{
-    kCFStringEncodingUTF8, CFStringGetCString, CFStringGetLength,
-    CFStringRef, CFStringCreateWithCString,
+use std::{
+    ffi::{CStr, CString},
+    os::raw::c_void,
 };
-#[cfg(target_os = "macos")]
-use core_foundation::runloop::{CFRunLoopRun, CFRunLoopGetCurrent, kCFRunLoopDefaultMode, CFRunLoopAddSource};
-#[cfg(target_os = "macos")]
+
+use anyhow::{Result, anyhow};
+use core_foundation::{
+    base::{CFRelease, CFTypeRef, kCFAllocatorDefault},
+    number::{CFNumberGetValue, CFNumberRef, kCFNumberSInt32Type},
+    runloop::{CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun, kCFRunLoopDefaultMode},
+    string::{
+        CFStringCreateWithCString, CFStringGetCString, CFStringGetLength, CFStringRef,
+        kCFStringEncodingUTF8,
+    },
+};
 use io_kit_sys::{
-    kIOMasterPortDefault,
-    IONotificationPortCreate, IONotificationPortGetRunLoopSource,
-    IOObjectRelease, IOIteratorNext,
-    IORegistryEntryCreateCFProperty, IORegistryEntryGetPath,
-    IOServiceAddMatchingNotification, IOServiceGetMatchingServices, IOServiceMatching,
-    IORegistryEntryCreateIterator,
+    IOIteratorNext, IONotificationPortCreate, IONotificationPortGetRunLoopSource,
+    IONotificationPortRef, IOObjectRelease, IORegistryEntryCreateCFProperty,
+    IORegistryEntryCreateIterator, IORegistryEntryGetPath, IOServiceAddMatchingNotification,
+    IOServiceGetMatchingServices, IOServiceMatching, kIOMasterPortDefault,
+    kIORegistryIterateRecursively,
+    keys::kIOPublishNotification,
+    types::{io_iterator_t, io_service_t},
 };
-#[cfg(target_os = "macos")]
-use mach::port::mach_port_t;
+use log::{info, warn};
 
-#[cfg(target_os = "macos")]
-#[allow(non_camel_case_types)]
-type io_iterator_t = mach_port_t;
-#[cfg(target_os = "macos")]
-#[allow(non_camel_case_types)]
-type io_service_t = mach_port_t;
+use crate::{DeviceMonitor, RawDeviceInfo};
 
-// ... 常量定义保持不变 ...
-#[cfg(target_os = "macos")]
-const K_IOUSB_DEVICE_CLASS_NAME: &[u8] = b"IOUSBDevice\0";
-#[cfg(target_os = "macos")]
-const K_USB_VENDOR_ID: &[u8] = b"idVendor\0";
-#[cfg(target_os = "macos")]
-const K_USB_PRODUCT_ID: &[u8] = b"idProduct\0";
-#[cfg(target_os = "macos")]
-const K_USB_SERIAL_NUMBER: &[u8] = b"USB Serial Number\0";
-#[cfg(target_os = "macos")]
-const K_USB_LOCATION_ID: &[u8] = b"locationID\0";
-#[cfg(target_os = "macos")]
-const K_IO_PUBLISH_NOTIFICATION: &[u8] = b"IOServicePublish\0";
-#[cfg(target_os = "macos")]
-const K_IO_TERMINATE_NOTIFICATION: &[u8] = b"IOServiceTerminate\0";
-#[cfg(target_os = "macos")]
-const K_IO_DIALIN_DEVICE: &[u8] = b"IODialinDevice\0";
-#[cfg(target_os = "macos")]
-const K_IO_CALLOUT_DEVICE: &[u8] = b"IOCalloutDevice\0";
+const IO_USB_DEVICE: &str = "IOUSBDevice";
+const IO_SERVICE: &str = "IOService";
+const IO_CALLOUT_DEVICE: &str = "IOCalloutDevice";
+const IO_DIALIN_DEVICE: &str = "IODialinDevice";
+const ID_VENDOR: &str = "idVendor";
+const ID_PRODUCT: &str = "idProduct";
+const USB_SERIAL_NUMBER: &str = "USB Serial Number";
+const USB_PRODUCT_NAME: &str = "USB Product Name";
+const LOCATION_ID: &str = "locationID";
 
-#[cfg(target_os = "macos")]
-pub struct MacosMonitor;
+// 建立与内核的通信管道
+pub struct MacMonitor;
 
-#[cfg(target_os = "macos")]
-impl MacosMonitor {
-    pub fn new() -> Self { Self }
+impl Default for MacMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    unsafe fn get_device_path(service: io_service_t) -> String {
-        let mut path_buffer: [i8; 512] = [0; 512];
-        let plane = CString::new("IOService").unwrap();
-        unsafe { IORegistryEntryGetPath(service, plane.as_ptr(), path_buffer.as_mut_ptr()) };
-        unsafe { CStr::from_ptr(path_buffer.as_ptr())
-            .to_string_lossy()
-            .into_owned() }
+impl MacMonitor {
+    pub fn new() -> Self {
+        Self
     }
 
-    /// 执行单次查找
-    unsafe fn find_modem_paths_once(device_service: io_service_t) -> (Option<String>, Option<String>) {
+    // 开始监听
+    pub fn start(&self) {
+        // 开始 macOS IOKit 监听
+        info!("=== Start macOS IOKit monitoring ===");
+
+        let notify_port = Self::create_notification_port();
+
+        Self::register_usb_listener(notify_port);
+
+        // 准备就绪，按 Ctrl+C 退出，尝试插入 USB 设备...
+        info!("=== Ready. Press Ctrl+C to exit. Attempting to insert a USB device... ===");
+
+        unsafe { CFRunLoopRun() };
+    }
+
+    /**
+     * 核心概念解析，以生活中的例子：
+     * Kernel：邮局
+     * Notification Port：家门口的邮箱
+     * RunLoop Source：是邮箱上的红色小旗子（美式邮箱，有信时旗子会竖起）
+     * RunLoop：你自己（坐在门口发呆，没事就喜欢睡觉）
+     * CFRunLoopAddSource：只要是红色小旗子竖起来，（Source被触发），我就醒过来取拿信。
+     */
+    // 第一步：建立连接
+    // 返回 IONotificationPortRef
+    fn create_notification_port() -> IONotificationPortRef {
+        // kIOMasterPortDefault 通常是0，表示默认的主端口
+        // 所有的 IOKit 操作都需要通过主端口进行
+        let master_port = unsafe { kIOMasterPortDefault };
+
+        // 内核发生事件时候，通过这个端口发送消息
+        let notifi_port = unsafe { IONotificationPortCreate(master_port) };
+        // 检测这个指针是否为空
+        if notifi_port.is_null() {
+            // 致命错误：无法创建 IOKit 通知端口，系统可能出现异常
+            panic!(
+                "Error Unable to create IOKit notification port; the system may be experiencing an error."
+            );
+        }
+
+        // 通知线程可能会休眠，我们需要一个机制来叫醒通知线程
+        // RunLoop Source就是这个机制，当有消息来临的时候，这个 Source 就会被触发
+        let run_loop_source = unsafe { IONotificationPortGetRunLoopSource(notifi_port) };
+        // 获取当前线程的 RunLoop
+        // 注意：如果是在主线程调用，就是主线程的RunLoop；如果是在子线程调用，就是子线程的RunLoop
+        let run_loop = unsafe { CFRunLoopGetCurrent() };
+
+        // 消息处理。告诉RunLoop：“嘿伙计，帮我看着点这个 Source，如果它响了，就处理它”
+        // kCFRunLoopDefaultMode：程序在正常或者空闲状态下都接收消息
+        unsafe { CFRunLoopAddSource(run_loop, run_loop_source, kCFRunLoopDefaultMode) };
+
+        // 管道已铺设完毕，正在监听内核消息...
+        info!(
+            "[Step 1 create_notification_port Success] The connection with the kernel has been established, and it is now listening for kernel messages..."
+        );
+
+        notifi_port
+    }
+
+    /**
+     * 核心概念解析
+     * IOUSBDevice：macOS内核对象层级树中的一个节点类型，当你插入一个USB设备时，内核会生成一个 IOUSBDevice 对象。
+     * 这一步就是告诉系统，我要过滤所有的 IOUSBDevice
+     */
+    // 第二步，开始订阅
+    fn create_usb_matching_dictionary() -> *mut c_void {
+        let class_name = IO_USB_DEVICE;
+
+        let class_name_c = CString::new(class_name)
+            .expect("[create_usb_matching_dictionary] Failed to create CString");
+
+        let matching_dict = unsafe { IOServiceMatching(class_name_c.as_ptr()) };
+
+        if matching_dict.is_null() {
+            // 致命错误：无法创建匹配字典 (IOServiceMatching failed)
+            panic!("Error Unable to create matching dictionary.(IOServiceMatching failed)");
+        }
+
+        // 订阅单已填写：只关注 class_name
+        info!(
+            "[Step 2 create_usb_matching_dictionary Success] Subscription form has been filled out: Only interested in {}",
+            class_name
+        );
+
+        matching_dict as *mut c_void
+    }
+
+    // 第三步，注册通知
+    fn register_usb_listener(notify_port: IONotificationPortRef) {
+        let matching_dict = Self::create_usb_matching_dictionary();
+
         let mut iterator: io_iterator_t = 0;
-        let plane_cstr = CString::new("IOService").unwrap();
 
-        let ret = unsafe { IORegistryEntryCreateIterator(
-            device_service,
-            plane_cstr.as_ptr(),
-            1, // kIORegistryIterateRecursively
-            &mut iterator
-        ) };
+        let result = unsafe {
+            IOServiceAddMatchingNotification(
+                notify_port,
+                kIOPublishNotification as *mut i8,
+                matching_dict as *mut _,
+                device_added_callback,
+                std::ptr::null_mut(),
+                &mut iterator,
+            )
+        };
 
-        if ret != 0 {
-            return (None, None);
+        if result != 0 {
+            // 注册通知失败，错误码: result
+            panic!("Registration notification failed, error code: {}", result);
         }
 
-        let mut cu_path = None;
-        let mut tty_path = None;
-        let mut child_service: io_service_t;
+        // 监听已注册！正在处理现有设备...
+        info!(
+            "[Step 3 register_usb_listener Success] Listener registered! Processing existing devices."
+        );
 
-        while {
-            child_service = unsafe { IOIteratorNext(iterator) };
-            child_service != 0
-        } {
-            if cu_path.is_none() {
-                if let Some(path) = unsafe { Self::get_ioreg_string(child_service, K_IO_CALLOUT_DEVICE) } {
-                    cu_path = Some(path);
-                }
-            }
-            if tty_path.is_none() {
-                if let Some(path) = unsafe { Self::get_ioreg_string(child_service, K_IO_DIALIN_DEVICE) } {
-                    tty_path = Some(path);
-                }
-            }
-            if cu_path.is_some() && tty_path.is_some() {
-                unsafe { IOObjectRelease(child_service) };
-                break;
-            }
-            unsafe { IOObjectRelease(child_service) };
-        }
-        unsafe { IOObjectRelease(iterator) };
-        (cu_path, tty_path)
+        unsafe { device_added_callback(std::ptr::null_mut(), iterator) };
     }
 
-    /// 带重试机制的查找
-    /// 这里的重试非常关键，因为 USB 驱动加载和 /dev 节点的创建比设备插入事件要滞后
-    fn find_modem_paths_with_retry(device_service: io_service_t) -> (Option<String>, Option<String>) {
-        // 配置：最多重试 10 次，每次间隔 100ms，总共等待 1秒
-        // 对于非串口设备（如键盘），这会引入 1秒 的延迟，但在工业机器人场景下这是可以接受的
-        const MAX_RETRIES: usize = 10;
-        const RETRY_INTERVAL: u64 = 100;
+    // 转换函数，给定设备对象和属性名，得到i32数值
+    fn get_ioreg_number(service: io_service_t, key: &str) -> Option<i32> {
+        let key_c = CString::new(key).expect("[get_ioreg_number] Failed to create CString");
+        let key_cf = unsafe {
+            CFStringCreateWithCString(kCFAllocatorDefault, key_c.as_ptr(), kCFStringEncodingUTF8)
+        };
 
-        unsafe {
-            for _ in 0..MAX_RETRIES {
-                let (cu, tty) = Self::find_modem_paths_once(device_service);
+        // 查询数据库
+        let val_ref =
+            unsafe { IORegistryEntryCreateCFProperty(service, key_cf, kCFAllocatorDefault, 0) };
 
-                // 如果找到了其中任何一个，通常说明驱动已经加载了，我们可以返回
-                // (通常 cu 和 tty 是同时出现的，或者至少出现一个)
-                if cu.is_some() || tty.is_some() {
-                    return (cu, tty);
-                }
-
-                // 没找到，睡一会再试
-                thread::sleep(Duration::from_millis(RETRY_INTERVAL));
-            }
-
-            // 彻底超时，说明这可能不是一个串口设备，或者驱动挂了
-            (None, None)
-        }
-    }
-
-    fn parse_device(service: io_service_t, system_path: String) -> Option<RawDeviceInfo> {
-        unsafe {
-            let vid = Self::get_ioreg_number(service, K_USB_VENDOR_ID)? as u16;
-            let pid = Self::get_ioreg_number(service, K_USB_PRODUCT_ID)? as u16;
-            let serial = Self::get_ioreg_string(service, K_USB_SERIAL_NUMBER);
-
-            let location_id = Self::get_ioreg_number(service, K_USB_LOCATION_ID).unwrap_or(0);
-            let port_path = format!("0x{:08x}", location_id);
-
-            // 修改点：使用带重试的查找函数
-            let (cu, tty) = Self::find_modem_paths_with_retry(service);
-
-            let (final_system_path, system_path_alt) = match (cu, tty) {
-                (Some(c), Some(t)) => (c, Some(t)),
-                (Some(c), None)    => (c, None),
-                (None, Some(t))    => (t, None),
-                (None, None)       => (system_path, None)
-            };
-
-            Some(RawDeviceInfo {
-                vid,
-                pid,
-                serial,
-                port_path,
-                system_path: final_system_path,
-                system_path_alt,
-            })
-        }
-    }
-
-    // ... 下面的 get_ioreg_number, get_ioreg_string 等辅助函数保持不变 ...
-    unsafe fn get_ioreg_number(service: io_service_t, key: &[u8]) -> Option<i32> {
-        let key_cf = unsafe { Self::create_cfstring(key) };
-        let val_ref = unsafe { IORegistryEntryCreateCFProperty(
-            service,
-            key_cf,
-            kCFAllocatorDefault,
-            0
-        ) };
+        // 释放 key_cf
         unsafe { CFRelease(key_cf as CFTypeRef) };
 
-        if val_ref.is_null() { return None; }
+        if val_ref.is_null() {
+            return None;
+        }
 
         let mut value: i32 = 0;
-        let success = unsafe { CFNumberGetValue(
-            val_ref as CFNumberRef,
-            kCFNumberSInt32Type,
-            &mut value as *mut _ as *mut c_void
-        ) };
+        let success = unsafe {
+            CFNumberGetValue(
+                val_ref as CFNumberRef,
+                kCFNumberSInt32Type,
+                &mut value as *mut _ as *mut c_void,
+            )
+        };
+
+        // 释放 val_ref
         unsafe { CFRelease(val_ref) };
 
         if success { Some(value) } else { None }
     }
 
-    unsafe fn get_ioreg_string(service: io_service_t, key: &[u8]) -> Option<String> {
-        let key_cf = unsafe { Self::create_cfstring(key) };
-        let val_ref = unsafe { IORegistryEntryCreateCFProperty(
-            service,
-            key_cf,
-            kCFAllocatorDefault,
-            0
-        ) };
+    // 转换函数，给定设备对象和属性名，得到 Rust String
+    fn get_ioreg_string(service: io_service_t, key: &str) -> Option<String> {
+        let key_c = CString::new(key).expect("[get_ioreg_number] Failed to create CString");
+        let key_cf = unsafe {
+            CFStringCreateWithCString(kCFAllocatorDefault, key_c.as_ptr(), kCFStringEncodingUTF8)
+        };
+
+        // 查询数据库
+        let val_ref =
+            unsafe { IORegistryEntryCreateCFProperty(service, key_cf, kCFAllocatorDefault, 0) };
+
+        // 释放 key_cf
         unsafe { CFRelease(key_cf as CFTypeRef) };
 
-        if val_ref.is_null() { return None; }
+        if val_ref.is_null() {
+            return None;
+        }
 
-        let mut result = None;
+        // 转换字符串
         let cf_str = val_ref as CFStringRef;
         let len = unsafe { CFStringGetLength(cf_str) };
+        // 分配缓冲区： 长度 * 3（防止UTF8多字节） + 1 （结尾\0）
         let max_size = len * 3 + 1;
         let mut buffer = vec![0u8; max_size as usize];
 
-        if unsafe { CFStringGetCString(
-            cf_str,
-            buffer.as_mut_ptr() as *mut i8,
-            max_size,
-            kCFStringEncodingUTF8
-        ) } != 0 {
+        let mut result = None;
+        if unsafe {
+            CFStringGetCString(
+                cf_str,
+                buffer.as_mut_ptr() as *mut i8,
+                max_size,
+                kCFStringEncodingUTF8,
+            )
+        } != 0
+        {
             let c_str = unsafe { CStr::from_ptr(buffer.as_ptr() as *const i8) };
             result = Some(c_str.to_string_lossy().into_owned());
         }
 
         unsafe { CFRelease(val_ref) };
+
         result
     }
 
-    unsafe fn create_cfstring(bytes: &[u8]) -> CFStringRef {
-        let c_str = CStr::from_bytes_with_nul(bytes).unwrap();
-        unsafe { CFStringCreateWithCString(kCFAllocatorDefault, c_str.as_ptr(), kCFStringEncodingUTF8) }
+    /**
+     * 在 macOS 插上一个 USB 转串口芯片（比如 Arduino 或 Lidar）时，内核里会生成这样一颗树：
+     * IOUSBDevice (物理设备, 我们在这)
+     * |
+     * +-- IOUSBInterface (接口层)
+     *      |
+     *      +-- AppleUSBCDCACMData (驱动层)
+     *           |
+     *           +-- IOCalloutDevice (这才是 /dev/cu!)
+     *           +-- IODialinDevice (这才是 /dev/tty!)
+     */
+    // 递归查找 TTY 设备路径
+    // 返回两个数据：
+    // IOCalloutDevice -> /dev/cu.* (主要用这个，Open 时不阻塞)
+    // IODialinDevice -> /dev/tty.* (备用)
+    fn find_modem_paths(device_service: io_service_t) -> (Option<String>, Option<String>) {
+        let mut iterator: io_iterator_t = 0;
+
+        let plane_cstr =
+            CString::new(IO_SERVICE).expect("[find_modem_paths] Failed to create CString");
+
+        let ret = unsafe {
+            IORegistryEntryCreateIterator(
+                device_service,
+                plane_cstr.as_ptr(),
+                kIORegistryIterateRecursively,
+                &mut iterator,
+            )
+        };
+
+        let mut cu_path = None;
+        let mut tty_path = None;
+
+        if ret == 0 {
+            let mut child_service: io_service_t;
+
+            while {
+                child_service = unsafe { IOIteratorNext(iterator) };
+                child_service != 0
+            } {
+                if cu_path.is_none() {
+                    cu_path = Self::get_ioreg_string(child_service, IO_CALLOUT_DEVICE);
+                }
+
+                if tty_path.is_none() {
+                    tty_path = Self::get_ioreg_string(child_service, IO_DIALIN_DEVICE);
+                }
+
+                unsafe { IOObjectRelease(child_service) };
+
+                if cu_path.is_some() && tty_path.is_some() {
+                    break;
+                }
+            }
+        }
+
+        unsafe { IOObjectRelease(iterator) };
+
+        (cu_path, tty_path)
+    }
+
+    // 生成设备唯一ID
+    fn get_device_id(service: io_service_t) -> String {
+        let mut path_buffer = [0i8; 512];
+
+        let plane = CString::new(IO_SERVICE).expect("[get_device_id] Failed to create CString");
+
+        unsafe { IORegistryEntryGetPath(service, plane.as_ptr(), path_buffer.as_mut_ptr()) };
+
+        unsafe { CStr::from_ptr(path_buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    // 整合
+    fn parse_device(service: io_service_t) -> Option<RawDeviceInfo> {
+        let vid = Self::get_ioreg_number(service, ID_VENDOR)? as u16;
+        let pid = Self::get_ioreg_number(service, ID_PRODUCT)? as u16;
+        let serial = Self::get_ioreg_string(service, USB_SERIAL_NUMBER);
+
+        let location_id = Self::get_ioreg_number(service, LOCATION_ID).unwrap_or_default();
+        let port_path = format!("0x{:08x}", location_id);
+
+        let registry_path = Self::get_device_id(service);
+
+        let (cu, tty) = Self::find_modem_paths(service);
+
+        // 策略：如果是串口设备，优先用 cu。如果不是(比如键盘)，用 registry_path 占位。
+        let (system_path, system_path_alt) = match (cu, tty) {
+            (Some(c), Some(t)) => (c, Some(t)),    // 完美：都有
+            (Some(c), None) => (c, None),          // 只有 cu
+            (None, Some(t)) => (t, None),          // 只有 tty
+            (None, None) => (registry_path, None), // 不是串口设备
+        };
+
+        Some(RawDeviceInfo {
+            vid,
+            pid,
+            serial,
+            port_path,
+            system_path,
+            system_path_alt,
+        })
     }
 }
 
-// ... 结构体 MonitorContext, device_callback, SendableContextPtr 等保持不变 ...
-#[cfg(target_os = "macos")]
-struct MonitorContext {
-    tx: Sender<DeviceEvent>,
-    rules: Vec<DeviceRule>,
-    active_roles: Mutex<HashMap<String, String>>,
-    path_to_role: Mutex<HashMap<String, String>>,
+impl DeviceMonitor for MacMonitor {
+    fn start(
+        &self,
+        rules: Vec<crate::DeviceRule>,
+        event_sender: crossbeam_channel::Sender<crate::DeviceEvent>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn scan_now(&self) -> Result<Vec<RawDeviceInfo>> {
+        let class_name =
+            CString::new(IO_USB_DEVICE).expect("[IO_USB_DEVICE] Failed to create CString");
+        let matching_dict = unsafe { IOServiceMatching(class_name.as_ptr()) };
+
+        if matching_dict.is_null() {
+            return Err(anyhow!("Failed to create matching dictionary"));
+        }
+
+        let mut iterator: io_iterator_t = 0;
+
+        let ret = unsafe {
+            IOServiceGetMatchingServices(kIOMasterPortDefault, matching_dict, &mut iterator)
+        };
+
+        if ret != 0 {
+            return Err(anyhow!(
+                "IOServiceGetMatchingServices failed with code: {}",
+                ret
+            ));
+        }
+
+        let mut devices = vec![];
+        let mut service: io_service_t;
+
+        while {
+            service = unsafe { IOIteratorNext(iterator) };
+            service != 0
+        } {
+            if let Some(info) = Self::parse_device(service) {
+                devices.push(info);
+            }
+
+            unsafe { IOObjectRelease(service) };
+        }
+
+        unsafe { IOObjectRelease(iterator) };
+
+        Ok(devices)
+    }
 }
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn device_callback(
-    ref_con: *mut c_void,
-    iterator: io_iterator_t,
-) {
-    let ctx = unsafe { &*(ref_con as *const MonitorContext) };
-    let mut service: io_service_t;
+// 定义回调函数
+unsafe extern "C" fn device_added_callback(_ref_con: *mut c_void, iterator: io_iterator_t) {
+    let mut device: io_service_t;
 
     while {
-        service = unsafe { IOIteratorNext(iterator) };
-        service != 0
+        device = unsafe { IOIteratorNext(iterator) };
+        device != 0
     } {
-        let mut active_roles = ctx.active_roles.lock().unwrap();
-        let mut path_to_role = ctx.path_to_role.lock().unwrap();
+        // 收到一个 USB 设备事件！(Device ID: xxxxxx)
+        info!(
+            "[Callback], A USB device event has been received! (Device ID: {})",
+            device
+        );
 
-        let registry_path = unsafe { MacosMonitor::get_device_path(service) };
+        let vid = MacMonitor::get_ioreg_number(device, ID_VENDOR);
+        let pid = MacMonitor::get_ioreg_number(device, ID_PRODUCT);
+        let serial = MacMonitor::get_ioreg_string(device, USB_SERIAL_NUMBER);
+        let name = MacMonitor::get_ioreg_string(device, USB_PRODUCT_NAME);
 
-        if let Some(role) = path_to_role.remove(&registry_path) {
-            active_roles.remove(&role);
-            ctx.tx.send(DeviceEvent::Detached(role)).ok();
+        if let (Some(v), Some(p)) = (vid, pid) {
+            info!("   VID: 0x{:04x} ({})", v, v);
+            info!("   PID: 0x{:04x} ({})", p, p);
+            info!("   Device: {:?}", name.unwrap_or("Unknown".to_string()));
+            info!("   Serial: {:?}", serial.unwrap_or("N/A".to_string()));
         } else {
-            if let Some(dev) = MacosMonitor::parse_device(service, registry_path.clone()) {
-                for rule in &ctx.rules {
-                    if let Some(method) = rule.matches(&dev) {
-                        if !active_roles.contains_key(&rule.role) {
-                            active_roles.insert(rule.role.clone(), dev.system_path.clone());
-                            path_to_role.insert(registry_path.clone(), rule.role.clone());
-
-                            ctx.tx.send(DeviceEvent::Attached(ResolvedDevice {
-                                role: rule.role.clone(),
-                                device: dev.clone(),
-                                match_method: method,
-                            })).ok();
-                            break;
-                        }
-                    }
-                }
-            }
+            warn!("   [Warn] 无法读取 VID/PID (可能设备刚拔出)");
         }
 
-        unsafe { IOObjectRelease(service) };
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-struct SendableContextPtr(*mut c_void);
-
-#[cfg(target_os = "macos")]
-unsafe impl Send for SendableContextPtr {}
-
-#[cfg(target_os = "macos")]
-impl DeviceMonitor for MacosMonitor {
-    // ... scan_now 保持不变 ...
-    fn scan_now(&self) -> Result<Vec<RawDeviceInfo>> {
-        unsafe {
-            let matching_dict = IOServiceMatching(K_IOUSB_DEVICE_CLASS_NAME.as_ptr() as *const i8);
-            let mut iterator: io_iterator_t = 0;
-
-            let ret = IOServiceGetMatchingServices(
-                kIOMasterPortDefault,
-                matching_dict,
-                &mut iterator
-            );
-
-            if ret != 0 {
-                return Err(anyhow!("Failed to create iterator"));
-            }
-
-            let mut devices = Vec::new();
-            let mut service: io_service_t;
-            while {
-                service = IOIteratorNext(iterator);
-                service != 0
-            } {
-                let path = Self::get_device_path(service);
-                if let Some(info) = Self::parse_device(service, path) {
-                    devices.push(info);
-                }
-                IOObjectRelease(service);
-            }
-            IOObjectRelease(iterator);
-
-            Ok(devices)
-        }
-    }
-
-    // ... start 保持不变 ...
-    fn start(&self, rules: Vec<DeviceRule>, tx: Sender<DeviceEvent>) -> Result<()> {
-        let initial = self.scan_now()?;
-        let active_roles = Mutex::new(HashMap::new());
-        let path_to_role = Mutex::new(HashMap::new());
-
-        {
-            let mut ar = active_roles.lock().unwrap();
-            let mut ptr = path_to_role.lock().unwrap();
-
-            for dev in initial {
-                for rule in &rules {
-                    if let Some(method) = rule.matches(&dev) {
-                        if !ar.contains_key(&rule.role) {
-                            ar.insert(rule.role.clone(), dev.system_path.clone());
-                            ptr.insert(dev.system_path.clone(), rule.role.clone());
-                            tx.send(DeviceEvent::Attached(ResolvedDevice {
-                                role: rule.role.clone(),
-                                device: dev.clone(),
-                                match_method: method,
-                            })).ok();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let context = Box::new(MonitorContext {
-            tx,
-            rules,
-            active_roles,
-            path_to_role,
-        });
-
-        let context_ptr = Box::into_raw(context) as *mut c_void;
-        let context_addr = context_ptr as usize;
-
-        thread::spawn(move || unsafe {
-            let ctx_ptr = context_addr as *mut c_void;
-
-            let notify_port = IONotificationPortCreate(kIOMasterPortDefault);
-            let run_loop_source = IONotificationPortGetRunLoopSource(notify_port);
-            let run_loop = CFRunLoopGetCurrent();
-
-            CFRunLoopAddSource(
-                run_loop,
-                run_loop_source,
-                kCFRunLoopDefaultMode
-            );
-
-            let matching_dict_add = IOServiceMatching(K_IOUSB_DEVICE_CLASS_NAME.as_ptr() as *const i8);
-            let mut iter_add: io_iterator_t = 0;
-            IOServiceAddMatchingNotification(
-                notify_port,
-                K_IO_PUBLISH_NOTIFICATION.as_ptr() as *mut i8,
-                matching_dict_add,
-                device_callback,
-                ctx_ptr,
-                &mut iter_add
-            );
-            device_callback(ctx_ptr, iter_add);
-
-            let matching_dict_rem = IOServiceMatching(K_IOUSB_DEVICE_CLASS_NAME.as_ptr() as *const i8);
-            let mut iter_rem: io_iterator_t = 0;
-            IOServiceAddMatchingNotification(
-                notify_port,
-                K_IO_TERMINATE_NOTIFICATION.as_ptr() as *mut i8,
-                matching_dict_rem,
-                device_callback,
-                ctx_ptr,
-                &mut iter_rem
-            );
-            device_callback(ctx_ptr, iter_rem);
-
-            CFRunLoopRun();
-        });
-
-        Ok(())
+        unsafe { IOObjectRelease(device) };
     }
 }
