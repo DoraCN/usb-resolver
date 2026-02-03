@@ -6,9 +6,9 @@
 //         这里存放着当前系统所有硬件的状态。
 //         要查 VID, 就读 idVendor 文件；要查 PID, 就读 idProduct 文件。
 //     动态事件 (udev / Netlink):
-//         当硬件插拔时, 内核会通过一个特殊的 Socket（Netlink Socket）向用户空间广播消息。
+//         当硬件插拔时, 内核会通过一个特殊的 Socket(Netlink Socket)向用户空间广播消息。
 //         udev 是 Linux 的设备管理器, 它监听这个 Socket, 处理这堆乱七八糟的消息, 并对外提供更友好的接口。
-// 前置要求: 在编译 Linux 版本之前, 你的系统（或开发容器）里必须安装 libudev 的开发包。
+// 前置要求: 在编译 Linux 版本之前, 你的系统(或开发容器)里必须安装 libudev 的开发包。
 //
 // Debian/Ubuntu: sudo apt install libudev-dev
 // Fedora: sudo dnf install systemd-devel
