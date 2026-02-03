@@ -68,17 +68,17 @@ impl DeviceRule {
         }
 
         // 2. 策略 A: 序列号匹配 (优先级最高)
-        if let (Some(rule_sn), Some(dev_sn)) = (&self.serial, &device.serial) {
-            if rule_sn == dev_sn {
-                return Some(MatchMethod::SerialExact);
-            }
+        if let (Some(rule_sn), Some(dev_sn)) = (&self.serial, &device.serial)
+            && rule_sn == dev_sn
+        {
+            return Some(MatchMethod::SerialExact);
         }
 
         // 2. 其次匹配物理路径
-        if let Some(rule_path) = &self.port_path {
-            if rule_path == &device.port_path {
-                return Some(MatchMethod::PortPath);
-            }
+        if let Some(rule_path) = &self.port_path
+            && rule_path == &device.port_path
+        {
+            return Some(MatchMethod::PortPath);
         }
 
         // 3. 如果规则里没写 SN 也没写 Path，则只要 VID/PID 对了就算匹配 (Loose 模式)
@@ -88,10 +88,10 @@ impl DeviceRule {
 
         // 3. 策略 B: 拓扑路径匹配 (回退策略)
         // 只有当序列号没匹配上（或配置没写序列号），且配置了路径时才尝试
-        if let Some(cfg_path) = &self.port_path {
-            if cfg_path == &device.port_path {
-                return Some(MatchMethod::TopologyFallback);
-            }
+        if let Some(cfg_path) = &self.port_path
+            && cfg_path == &device.port_path
+        {
+            return Some(MatchMethod::TopologyFallback);
         }
 
         None

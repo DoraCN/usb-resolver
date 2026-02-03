@@ -88,10 +88,10 @@ impl App {
     }
 
     fn open_popup(&mut self) {
-        if let Some(i) = self.table_state.selected() {
-            if let Some(dev) = self.sorted_devices.get(i) {
-                self.popup_device = Some(dev.clone());
-            }
+        if let Some(i) = self.table_state.selected()
+            && let Some(dev) = self.sorted_devices.get(i)
+        {
+            self.popup_device = Some(dev.clone());
         }
     }
 
@@ -167,23 +167,23 @@ fn run_app<B: Backend>(
         }
 
         // --- Handle Keyboard ---
-        if crossterm::event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                // 如果弹窗打开了，只响应 Esc 和 Enter(关闭)
-                if app.popup_device.is_some() {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.close_popup(),
-                        _ => {}
-                    }
-                } else {
-                    // 弹窗没打开，响应导航
-                    match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Down | KeyCode::Char('j') => app.next(),
-                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                        KeyCode::Enter => app.open_popup(),
-                        _ => {}
-                    }
+        if crossterm::event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            // 如果弹窗打开了，只响应 Esc 和 Enter(关闭)
+            if app.popup_device.is_some() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.close_popup(),
+                    _ => {}
+                }
+            } else {
+                // 弹窗没打开，响应导航
+                match key.code {
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Down | KeyCode::Char('j') => app.next(),
+                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                    KeyCode::Enter => app.open_popup(),
+                    _ => {}
                 }
             }
         }
@@ -341,12 +341,12 @@ fn render_popup(f: &mut Frame, dev: &RawDeviceInfo, app: &App) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled("Primary (ID): ", Style::default().fg(Color::Green)),
-            Span::raw(&dev.system_path),
-        ]),
-        Line::from(vec![
             Span::styled("Alt (Usable): ", Style::default().fg(Color::Green)),
             Span::raw(dev.system_path_alt.clone().unwrap_or("N/A".to_string())),
+        ]),
+        Line::from(vec![
+            Span::styled("Primary (ID): ", Style::default().fg(Color::Green)),
+            Span::raw(&dev.system_path),
         ]),
     ];
 
