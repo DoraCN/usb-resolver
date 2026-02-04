@@ -22,11 +22,9 @@ udev = "0.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_Devices_DeviceAndDriverInstallation",
-    "Win32_Devices_Properties",
-    "Win32_Security",
-    "implement",
+    "Win32_Foundation",                          # 基础类型 (BOOL, HANDLE)
+    "Win32_Devices_DeviceAndDriverInstallation", # SetupAPI 核心函数
+    "Win32_System_Registry",                     # 注册表类型常量 (REG_SZ)
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
