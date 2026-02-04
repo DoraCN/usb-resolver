@@ -1,23 +1,21 @@
-use crate::{DeviceEvent, DeviceMonitor, DeviceRule, RawDeviceInfo, ResolvedDevice};
+use std::{collections::HashSet, thread, time::Duration};
+
 use anyhow::Result;
 use crossbeam_channel::Sender;
-use std::collections::HashMap;
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
-use std::thread;
-use std::time::Duration;
-
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_Device_IDW, CR_SUCCESS, DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA,
-    SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SPDRP_LOCATION_PATHS, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW,
+    DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA, SPDRP_FRIENDLYNAME,
+    SPDRP_HARDWAREID, SPDRP_LOCATION_INFORMATION, SetupDiDestroyDeviceInfoList,
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
+    SetupDiGetDeviceRegistryPropertyW,
 };
+
+use crate::{DeviceEvent, DeviceMonitor, RawDeviceInfo};
 
 pub struct WindowsMonitor;
 
 impl Default for WindowsMonitor {
     fn default() -> Self {
-        Self
+        Self::new()
     }
 }
 
@@ -26,240 +24,273 @@ impl WindowsMonitor {
         Self
     }
 
-    fn trim_wide_string(buffer: &[u16], len: usize) -> String {
-        let actual_len = if len > 0 && buffer[len - 1] == 0 {
-            len - 1
-        } else {
-            len
-        };
-        OsString::from_wide(&buffer[..actual_len])
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn parse_dev_info(hdevinfo: HDEVINFO, devinfo_data: &SP_DEVINFO_DATA) -> Option<RawDeviceInfo> {
-        unsafe {
-            let hw_id =
-                Self::get_device_registry_property(hdevinfo, devinfo_data, SPDRP_HARDWAREID)?;
-
-            // 过滤：只保留包含 VID_ 的设备
-            if !hw_id.to_uppercase().contains("VID_") {
-                return None;
-            }
-
-            let (vid, pid) = Self::extract_vid_pid(&hw_id)?;
-
-            let mut instance_id_buffer = [0u16; 256];
-            if CM_Get_Device_IDW(devinfo_data.DevInst, &mut instance_id_buffer, 0) != CR_SUCCESS {
-                return None;
-            }
-            let end = instance_id_buffer
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(256);
-            let instance_id = OsString::from_wide(&instance_id_buffer[..end])
-                .to_string_lossy()
-                .into_owned();
-
-            let serial = instance_id.split('\\').next_back().map(|s| s.to_string());
-
-            let port_path =
-                Self::get_device_registry_property(hdevinfo, devinfo_data, SPDRP_LOCATION_PATHS)
-                    .unwrap_or_else(|| "unknown".to_string());
-
-            let friendly_name =
-                Self::get_device_registry_property(hdevinfo, devinfo_data, SPDRP_FRIENDLYNAME);
-
-            let com_port = friendly_name.as_ref().and_then(|name| {
-                if let Some(start) = name.find("(COM")
-                    && let Some(end) = name[start..].find(")")
-                {
-                    return Some(name[start + 1..start + end].to_string());
-                }
-                None
-            });
-
-            Some(RawDeviceInfo {
-                vid,
-                pid,
-                serial,
-                port_path,
-                system_path: instance_id,
-                system_path_alt: com_port,
-            })
-        }
-    }
-
-    unsafe fn get_device_registry_property(
-        hdevinfo: HDEVINFO,
-        devinfo_data: &SP_DEVINFO_DATA,
-        prop: u32,
+    // 从Windows属性中读取字符串
+    pub fn get_device_property(
+        dev_info: HDEVINFO,
+        dev_data: &mut SP_DEVINFO_DATA,
+        property: u32,
     ) -> Option<String> {
-        let mut required_len = 0;
-        let _ = unsafe {
+        // 准备缓冲区
+        let mut buffer = [0u8; 1024];
+        let mut required_size = 0u32;
+
+        // 调用Windows API获取属性
+        let success = unsafe {
             SetupDiGetDeviceRegistryPropertyW(
-                hdevinfo,
-                devinfo_data,
-                prop,
+                dev_info,
+                dev_data,
+                property,
                 None,
-                None,
-                Some(&mut required_len),
+                Some(&mut buffer),
+                Some(&mut required_size),
             )
         };
 
-        if required_len == 0 {
+        if success.is_err() {
             return None;
         }
 
-        let mut buffer = vec![0u8; required_len as usize];
-        let result = unsafe {
-            SetupDiGetDeviceRegistryPropertyW(
-                hdevinfo,
-                devinfo_data,
-                prop,
-                None,
-                Some(buffer.as_mut_slice()),
-                None,
-            )
-        };
-
-        if result.is_ok() {
-            let wide_buffer: Vec<u16> = buffer
-                .chunks_exact(2)
-                .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
-                .collect();
-            Some(Self::trim_wide_string(&wide_buffer, wide_buffer.len()))
-        } else {
-            None
+        // 将缓冲区转换为字符串
+        // Windows 返回的是 UTF-16 (u16)，但它以 u8 形式存在 buffer 里。
+        let len = (required_size as usize) / 2; // WCHAR 是2字节
+        if len == 0 {
+            return None;
         }
+
+        // 安全地将 u8 切片转换为 u16 切片
+        let ptr = buffer.as_ptr() as *const u16;
+        let u16_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+        // 转换为 Rust 字符串并去除尾部的空字符
+        // 注意：Windows API 返回的字符串通常以 null 结尾
+        // 我们使用 trim_matches 去除这些 null 字符
+        String::from_utf16(u16_slice)
+            .ok()
+            .map(|s| s.trim_matches(char::from(0)).to_string())
     }
 
-    fn extract_vid_pid(hw_id: &str) -> Option<(u16, u16)> {
-        let hw_id_upper = hw_id.to_uppercase();
-        let vid_idx = hw_id_upper.find("VID_")?;
-        let pid_idx = hw_id_upper.find("PID_")?;
+    //获取设备实例 ID (唯一路径)
+    // 结果示例: "USB\VID_1234&PID_5678\SN001" (有序列号)
+    // 或者:    "USB\VID_1234&PID_5678\5&2A3B4C5D&0&1" (无序列号，系统生成)
+    fn get_instance_id(dev_info: HDEVINFO, dev_data: &mut SP_DEVINFO_DATA) -> Option<String> {
+        let mut buffer = [0u16; 1024]; // 直接用 u16 数组
+        let mut required_size = 0;
 
-        if vid_idx + 8 > hw_id_upper.len() || pid_idx + 8 > hw_id_upper.len() {
+        let result = unsafe {
+            SetupDiGetDeviceInstanceIdW(
+                dev_info,
+                dev_data,
+                Some(&mut buffer),
+                Some(&mut required_size),
+            )
+        };
+
+        if result.is_err() {
             return None;
         }
 
-        let vid_str = &hw_id_upper[vid_idx + 4..vid_idx + 8];
-        let pid_str = &hw_id_upper[pid_idx + 4..pid_idx + 8];
+        let len = required_size as usize;
+        if len == 0 {
+            return None;
+        }
 
+        // 转为 String
+        String::from_utf16(&buffer[..len])
+            .ok()
+            .map(|s| s.trim_matches(char::from(0)).to_string())
+    }
+
+    // 解析 HardwareID 字符串
+    fn parse_hardware_id(id_str: &str) -> Option<(u16, u16)> {
+        // 示例 ID 字符串格式: "USB\VID_1AE4&PID_56B2&REV_0100"
+        // 1. 必须包含 "VID_" 和 "PID_"
+        let vid_index = id_str.find("VID_")?;
+        let pid_index = id_str.find("PID_")?;
+
+        // 2. 提取 VID (4位 hex)
+        // "VID_" 后面紧跟的 4 个字符
+        let vid_start = vid_index + 4;
+        if vid_start + 4 > id_str.len() {
+            return None;
+        }
+        let vid_str = &id_str[vid_start..vid_start + 4];
         let vid = u16::from_str_radix(vid_str, 16).ok()?;
+
+        // 3. 提取 PID (4位 hex)
+        // "PID_" 后面紧跟的 4 个字符
+        let pid_start = pid_index + 4;
+        if pid_start + 4 > id_str.len() {
+            return None;
+        }
+        let pid_str = &id_str[pid_start..pid_start + 4];
         let pid = u16::from_str_radix(pid_str, 16).ok()?;
 
         Some((vid, pid))
     }
+
+    fn scan_now() -> Result<Vec<RawDeviceInfo>> {
+        let mut devices = vec![];
+
+        let device_info_set =
+            unsafe { SetupDiGetClassDevsW(None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES) }?;
+
+        let mut dev_data = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+
+        let mut index = 0;
+
+        while unsafe { SetupDiEnumDeviceInfo(device_info_set, index, &mut dev_data).is_ok() } {
+            index += 1;
+
+            let hardware_id_raw = Self::get_device_property(
+                device_info_set,
+                &mut dev_data,
+                SPDRP_HARDWAREID, // 1
+            );
+
+            let hardware_id = match hardware_id_raw {
+                Some(id) => id,
+                None => continue,
+            };
+            // 这里的 ToUppercase 是为了防御性编程，防止某些厂商大小写乱写
+            if !hardware_id.to_uppercase().starts_with("USB") {
+                continue;
+            }
+
+            // 解析 VID / PID
+            let (vid, pid) = match Self::parse_hardware_id(&hardware_id) {
+                Some(res) => res,
+                None => continue, // 解析失败说明格式不对，跳过
+            };
+
+            // 读取 Instance ID (作为系统主路径 / 唯一 ID)
+            // 示例: "USB\VID_1234&PID_5678\SN_001"
+            // Windows 下这是绝对唯一的，适合做 System Path
+            // 让我们读 "FriendlyName" (友好名称)，里面通常包含 COM 口号
+            // 示例: "USB Serial Device (COM3)"
+            let friendly_name = Self::get_device_property(
+                device_info_set,
+                &mut dev_data,
+                SPDRP_FRIENDLYNAME, // 12
+            );
+
+            // 读取 Location Information (作为物理端口路径)
+            // 示例: "Port_#0002.Hub_#0001"
+            let port_path = Self::get_device_property(
+                device_info_set,
+                &mut dev_data,
+                SPDRP_LOCATION_INFORMATION, // 13
+            )
+            .unwrap_or_else(|| "unknown".to_string());
+
+            // 尝试从 FriendlyName 提取 COM 口 (作为备用路径)
+            // 如果 friendly_name 里包含 "(COM", 我们就把它提取出来
+            let system_path_alt = friendly_name.as_ref().and_then(|name| {
+                let start = name.find("(COM")?;
+                let end = name[start..].find(")")?;
+                // 提取 "COM3"
+                Some(name[start + 1..start + end].to_string())
+            });
+
+            // 构造 system_path (这里用 hardware_id 做前缀，如果能拿到 InstanceId 更好)
+            // 为了唯一性，如果能读到 Serial Number 最好
+            // 这里简化处理：用 HardwareID 作为 system_path 的一部分
+            let system_path = hardware_id.clone();
+
+            // 读取 Instance ID (作为真正的 System Path)
+            // 之前的 hardware_id 只是"型号"，Instance ID 才是"绝对路径"
+            // 示例: "USB\VID_1234&PID_5678\12345678"
+            let instance_id = match Self::get_instance_id(device_info_set, &mut dev_data) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            // 尝试读取序列号 (Windows 没有直接的 Serial 属性，通常藏在 Instance ID 的最后一段)
+            let serial = instance_id
+                .rsplit('\\') // 从右向左找第一个 '\'
+                .next()
+                .map(|s| s.to_string())
+                .filter(|s| !s.contains('&')); // 过滤掉 Windows 生成的 "5&2d..." 这种伪序列号
+
+            devices.push(RawDeviceInfo {
+                vid,
+                pid,
+                serial,
+                port_path,
+                system_path,
+                system_path_alt,
+            });
+        }
+
+        // 释放内存 (非常重要，否则内存泄漏)
+        unsafe {
+            let _ = SetupDiDestroyDeviceInfoList(device_info_set);
+        };
+
+        Ok(devices)
+    }
 }
 
 impl DeviceMonitor for WindowsMonitor {
-    fn scan_now(&self) -> Result<Vec<RawDeviceInfo>> {
-        unsafe {
-            // 广谱扫描：不传 Enumerator，只用 ALLCLASSES | PRESENT
-            let hdevinfo =
-                SetupDiGetClassDevsW(None, None, None, DIGCF_ALLCLASSES | DIGCF_PRESENT)?;
+    fn start(&self, tx: Sender<DeviceEvent>) -> Result<()> {
+        // 1. 初始扫描 (补发存量)
+        let mut known_devices: HashSet<String> = HashSet::new();
 
-            let mut devices = Vec::new();
-            let mut devinfo_data = SP_DEVINFO_DATA {
-                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
-                ..Default::default()
-            };
-
-            let mut i = 0;
-            while SetupDiEnumDeviceInfo(hdevinfo, i, &mut devinfo_data).is_ok() {
-                if let Some(info) = Self::parse_dev_info(hdevinfo, &devinfo_data) {
-                    devices.push(info);
-                }
-                i += 1;
-            }
-
-            let _ = SetupDiDestroyDeviceInfoList(hdevinfo);
-            Ok(devices)
-        }
-    }
-
-    fn start(&self, rules: Vec<DeviceRule>, tx: Sender<DeviceEvent>) -> Result<()> {
-        let mut active_roles: HashMap<String, String> = HashMap::new();
-
-        // 1. 初始扫描
-        log::info!("正在执行初始设备扫描...");
-        if let Ok(initial_devices) = self.scan_now() {
-            for dev in initial_devices {
-                for rule in &rules {
-                    if let Some(method) = rule.matches(&dev)
-                        && !active_roles.contains_key(&rule.role)
-                    {
-                        active_roles.insert(rule.role.clone(), dev.system_path.clone());
-                        tx.send(DeviceEvent::Attached(ResolvedDevice {
-                            role: rule.role.clone(),
-                            device: dev,
-                            match_method: method,
-                        }))
-                        .ok();
-                        break;
-                    }
-                }
+        if let Ok(devices) = self.scan_now() {
+            for dev in devices {
+                known_devices.insert(dev.system_path.clone());
+                tx.send(DeviceEvent::Attached(dev)).ok();
             }
         }
 
-        // 2. 启动轮询线程 (Polling Thread)
-        // 相比于复杂的 Windows 消息回调，轮询在 CLI 工具中更稳定、更不容易崩溃
-        let monitor = WindowsMonitor::new();
-
+        // 2. 启动轮询线程
         thread::spawn(move || {
-            log::info!("[Windows] 启动轮询监控模式，扫描间隔: 1秒");
             loop {
+                // 1秒轮询一次
                 thread::sleep(Duration::from_secs(1));
 
-                // 执行全量扫描
-                let current_devices = match monitor.scan_now() {
+                // 再次扫描
+                let current_devices = match Self::scan_now() {
                     Ok(devs) => devs,
                     Err(e) => {
-                        log::error!("扫描失败: {:?}", e);
+                        eprintln!("[Windows] Scan failed: {:?}", e);
                         continue;
                     }
                 };
 
-                // --- Diff 算法 ---
+                // 找出现在的 ID 集合
+                let current_ids: HashSet<String> = current_devices
+                    .iter()
+                    .map(|d| d.system_path.clone())
+                    .collect();
 
-                // 1. 检测【新上线】
+                // Check A: 新增的设备 (Present now but not before)
                 for dev in &current_devices {
-                    for rule in &rules {
-                        if let Some(method) = rule.matches(dev) {
-                            // 如果 active_roles 里没有这个 role，说明是新设备
-                            if !active_roles.contains_key(&rule.role) {
-                                log::info!("[Windows] 设备上线: {}", rule.role);
-                                active_roles.insert(rule.role.clone(), dev.system_path.clone());
-                                tx.send(DeviceEvent::Attached(ResolvedDevice {
-                                    role: rule.role.clone(),
-                                    device: dev.clone(),
-                                    match_method: method,
-                                }))
-                                .ok();
-                            }
-                            break; // 匹配到一个规则就跳出规则循环
-                        }
+                    if !known_devices.contains(&dev.system_path) {
+                        tx.send(DeviceEvent::Attached(dev.clone())).ok();
+                        known_devices.insert(dev.system_path.clone());
                     }
                 }
 
-                // 2. 检测【已下线】
-                // 遍历 active_roles，如果它们对应的 system_path (InstanceID) 不在 current_devices 里，说明拔掉了
-                let mut removed_roles = Vec::new();
-                for (role, path) in active_roles.iter() {
-                    if !current_devices.iter().any(|d| &d.system_path == path) {
-                        removed_roles.push(role.clone());
+                // Check B: 移除的设备 (Present before but not now)
+                // retain 的逻辑是：保留返回 true 的，删除返回 false 的
+                // 我们利用这个副作用来发送移除事件
+                known_devices.retain(|old_path| {
+                    if !current_ids.contains(old_path) {
+                        tx.send(DeviceEvent::Detached(old_path.clone())).ok();
+                        return false; // 从 known_devices 删除
                     }
-                }
-
-                for role in removed_roles {
-                    log::info!("[Windows] 设备下线: {}", role);
-                    active_roles.remove(&role);
-                    tx.send(DeviceEvent::Detached(role)).ok();
-                }
+                    true // 保留
+                });
             }
         });
 
         Ok(())
+    }
+
+    fn scan_now(&self) -> Result<Vec<RawDeviceInfo>> {
+        Self::scan_now()
     }
 }
